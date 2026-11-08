@@ -219,7 +219,14 @@ async function startMic() {
     mode = 'mic';
     toast('Listening… play some EDM nearby, clap, or make noise 🔊');
   } catch (e) {
-    toast('The microphone is blocked here. Use Demo beat or Upload track — or open this page directly in a browser to use the mic.', 7000);
+    const n = e && e.name;
+    const inApp = !window.isSecureContext || window.self !== window.top;
+    let m;
+    if (!navigator.mediaDevices || inApp) m = 'The mic isn’t available in this viewer. Open the page in Safari itself (tap the compass/Safari icon or “Open in Safari”), then tap Mic again.';
+    else if (n === 'NotAllowedError') m = 'Mic permission was denied. In Safari tap “aA” → Website Settings → Microphone → Allow (or Settings → Apps → Safari → Microphone → Ask), reload, and tap Mic again.';
+    else if (n === 'NotFoundError') m = 'No microphone was found on this device.';
+    else m = 'Couldn’t start the mic (' + (n || 'unknown error') + '). If this page opened inside another app, open it in Safari and try again.';
+    toast(m, 9000);
   }
   updateButtons();
 }
@@ -272,7 +279,7 @@ const st = {
   move: 'sway', mir: false, moveB: 0, lastB: 0, hue: 190, t: 0, flash: 0, S: 2, gy: 400, pts: null
 };
 
-const REST = { hx: 0, hy: -78, torso: 0, head: 0, lua: -0.3, lfa: -0.12, rua: 0.3, rfa: 0.12, flx: -18, fly: 0, frx: 18, fry: 0 };
+const REST = { hx: 0, hy: -78, torso: 0, head: 0, lua: -0.45, lfa: -0.25, rua: 0.45, rfa: 0.25, flx: -18, fly: 0, frx: 18, fry: 0 };
 const KEYS = Object.keys(REST);
 const cur = { ...REST };
 const mirror = p => ({ hx: -p.hx, hy: p.hy, torso: -p.torso, head: -p.head, lua: -p.rua, lfa: -p.rfa, rua: -p.lua, rfa: -p.lfa, flx: -p.frx, fly: p.fry, frx: -p.flx, fry: p.fly });
