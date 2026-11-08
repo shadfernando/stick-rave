@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stick Rave — Noise-Reactive Dancer</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#07060d;--fg:#f4f2ff;--mut:#8d88a8;--acc:#7cf7ff}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--fg);font-family:Inter,system-ui,sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent;user-select:none}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+.hud{position:fixed;top:14px;left:16px;right:16px;display:flex;justify-content:space-between;align-items:flex-start;pointer-events:none}
+.title{font-family:Orbitron,sans-serif;font-weight:800;letter-spacing:.14em;font-size:15px}
+.title small{display:block;font-family:Inter,sans-serif;font-weight:400;letter-spacing:.02em;color:var(--mut);font-size:12px;margin-top:4px}
+.stats{text-align:right;font-family:Orbitron,sans-serif;font-size:11px;color:var(--mut);line-height:1.7;letter-spacing:.06em}
+.stats b{color:var(--fg);font-weight:600}
+.meter{width:96px;height:4px;background:#ffffff1a;border-radius:2px;margin:6px 0 0 auto;overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--acc);transition:width .05s linear}
+.bar{position:fixed;left:0;right:0;bottom:0;padding:14px 12px calc(14px + env(safe-area-inset-bottom));display:flex;flex-wrap:wrap;gap:8px;justify-content:center;align-items:center;background:linear-gradient(to top,#07060df2 55%,#07060d00)}
+button{font:600 14px Inter,sans-serif;color:var(--fg);background:#ffffff10;border:1px solid #ffffff24;border-radius:999px;padding:10px 16px;cursor:pointer;transition:background .15s}
+button:hover{background:#ffffff1c}
+button.on{background:var(--acc);color:#05040a;border-color:transparent}
+button.small{padding:10px 12px}
+.hidden{display:none}
+.sens{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);padding:0 6px}
+input[type=range]{width:110px;accent-color:var(--acc)}
+.toast{position:fixed;left:50%;bottom:118px;transform:translateX(-50%);max-width:min(92vw,460px);background:#15132acc;backdrop-filter:blur(8px);border:1px solid #ffffff22;border-radius:12px;padding:10px 14px;font-size:13px;line-height:1.45;text-align:center;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <div class="title">STICK RAVE<small>A stick man who dances to whatever he hears</small></div>
+  <div class="stats">
+    <div>MOVE <b id="mv">—</b></div>
+    <div>BPM <b id="bpm">—</b></div>
+    <div class="meter"><i id="lv"></i></div>
+  </div>
+</div>
+
+<div class="bar" id="bar">
+  <button id="bDemo">▶ Demo beat</button>
+  <button id="bTrack">🎵 Upload track</button>
+  <button id="bChange" class="small hidden" title="Load another track">📂</button>
+  <button id="bMic">🎤 Mic</button>
+  <label class="sens">Sensitivity <input id="sens" type="range" min="0.4" max="3" step="0.05" value="1.2"></label>
+  <input id="file" type="file" accept="audio/*" class="hidden">
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+const TAU = Math.PI * 2, PI = Math.PI;
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const avg = a => a.reduce((s, v) => s + v, 0) / (a.length || 1);
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
+const $ = id => document.getElementById(id);
+
+const cv = $('c'), ctx = cv.getContext('2d');
+let W, H, DPR;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- toast ---------- */
+let toastT;
+function toast(msg, ms = 3500) {
+  const el = $('toast'); el.textContent = msg; el.classList.add('show');
+  el.style.bottom = ($('bar').offsetHeight + 10) + 'px';
+  clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+/* ---------- audio core ---------- */
+let ac = null, analyser, freq, td, noiseBuf;
+function ensureAC() {
+  if (!ac) {
+    // iPhone: play through the speaker even when the silent switch is on
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = ac.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.5;
+    freq = new Uint8Array(analyser.frequencyBinCount);
+    td = new Uint8Array(analyser.fftSize);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  if (ac.state === 'suspended') ac.resume();
+}
+
+let mode = null; // 'demo' | 'track' | 'mic'
+let micStream = null, micNode = null, trackEl = null, trackNode = null, trackURL = null, trackName = '';
+
+function resetAnalysis() { st.ints = []; st.bh = []; st.rh = []; st.peak = 0.05; st.prevBass = 0; }
+
+function stopAll() {
+  stopDemo();
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (micNode) { micNode.disconnect(); micNode = null; }
+  if (trackEl) trackEl.pause();
+  mode = null; updateButtons();
+}
+
+/* ---------- demo EDM synth (128 BPM, build → breakdown → drop) ---------- */
+const demo = { bpm: 128, step: 0, next: 0, timer: null, out: null };
+const CH = [[0, 3, 7], [0, 4, 7], [0, 4, 7], [0, 4, 7]];   // Am  F  C  G
+const ROOT = [55, 43.65, 65.41, 49];
+
+function env(g, t, a, peak, dec) {
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + a);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + a + dec);
+}
+function kick(t) {
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.frequency.setValueAtTime(170, t); o.frequency.exponentialRampToValueAtTime(48, t + 0.11);
+  g.gain.setValueAtTime(1.1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+  o.connect(g).connect(demo.out); o.start(t); o.stop(t + 0.4);
+}
+function noise(t, type, f, q, vol, dec, att = 0.001) {
+  const s = ac.createBufferSource(); s.buffer = noiseBuf;
+  const fl = ac.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = q;
+  const g = ac.createGain(); env(g, t, att, vol, dec);
+  s.connect(fl).connect(g).connect(demo.out); s.start(t, Math.random() * 0.5); s.stop(t + att + dec + 0.05);
+}
+const hat = (t, v = 0.16, d = 0.06) => noise(t, 'highpass', 7500, 0.7, v, d);
+const clap = (t, v = 0.45) => noise(t, 'bandpass', 1700, 1.2, v, 0.16);
+const crash = t => noise(t, 'highpass', 4000, 0.5, 0.3, 1.6);
+function bass(t, f, d) {
+  const o = ac.createOscillator(), fl = ac.createBiquadFilter(), g = ac.createGain();
+  o.type = 'sawtooth'; o.frequency.value = f;
+  fl.type = 'lowpass'; fl.Q.value = 6;
+  fl.frequency.setValueAtTime(1400, t); fl.frequency.exponentialRampToValueAtTime(180, t + d);
+  env(g, t, 0.005, 0.3, d);
+  o.connect(fl).connect(g).connect(demo.out); o.start(t); o.stop(t + d + 0.05);
+}
+function stab(t, ci, v = 0.05, d = 0.22) {
+  const fl = ac.createBiquadFilter(); fl.type = 'lowpass';
+  fl.frequency.setValueAtTime(3200, t); fl.frequency.exponentialRampToValueAtTime(500, t + d);
+  const g = ac.createGain(); env(g, t, 0.004, v, d); fl.connect(g).connect(demo.out);
+  for (const s of CH[ci]) for (const det of [-10, 10]) {
+    const o = ac.createOscillator(); o.type = 'sawtooth';
+    o.frequency.value = ROOT[ci] * 8 * Math.pow(2, s / 12); o.detune.value = det;
+    o.connect(fl); o.start(t); o.stop(t + d + 0.05);
+  }
+}
+function pad(t, ci, d) {
+  const fl = ac.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = 1100;
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.045, t + 0.4);
+  g.gain.setValueAtTime(0.045, t + d - 0.25); g.gain.linearRampToValueAtTime(0.0001, t + d);
+  fl.connect(g).connect(demo.out);
+  for (const s of CH[ci]) for (const det of [-7, 7]) {
+    const o = ac.createOscillator(); o.type = 'sawtooth';
+    o.frequency.value = ROOT[ci] * 4 * Math.pow(2, s / 12); o.detune.value = det;
+    o.connect(fl); o.start(t); o.stop(t + d + 0.05);
+  }
+}
+function riser(t, d) {
+  const s = ac.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+  const fl = ac.createBiquadFilter(); fl.type = 'bandpass'; fl.Q.value = 2;
+  fl.frequency.setValueAtTime(300, t); fl.frequency.exponentialRampToValueAtTime(7000, t + d);
+  const g = ac.createGain(); g.gain.setValueAtTime(0.01, t); g.gain.linearRampToValueAtTime(0.22, t + d);
+  s.connect(fl).connect(g).connect(demo.out); s.start(t); s.stop(t + d);
+}
+function playStep(step, t) {
+  const spb = 60 / demo.bpm / 4, bar = Math.floor(step / 16) % 24, s = step % 16, ci = bar % 4, r = ROOT[ci];
+  if (bar < 8) {                       // build
+    if (s % 4 === 0) kick(t);
+    if (s % 4 === 2) { hat(t, 0.15, 0.09); bass(t, r * 2, spb * 1.8); }
+    if (bar >= 4 && (s === 4 || s === 12)) clap(t, 0.32);
+    if (bar >= 6 && s % 2 === 1) hat(t, 0.05, 0.03);
+  } else if (bar < 12) {               // breakdown
+    if (s === 0) pad(t, ci, spb * 16);
+    if (bar === 10 && s === 0) riser(t, spb * 32);
+    if (bar < 10 && s % 4 === 2) hat(t, 0.04, 0.05);
+    if (bar === 11 && (s >= 8 || s % 2 === 0)) clap(t, 0.08 + 0.022 * s);
+  } else {                             // drop
+    if (bar === 12 && s === 0) crash(t);
+    if (s % 4 === 0) kick(t);
+    if (s === 4 || s === 12) clap(t, 0.45);
+    if (s % 4 === 2) { hat(t, 0.18, 0.09); bass(t, r * 2, spb * 1.8); }
+    else if (s % 2 === 1) hat(t, 0.06, 0.03);
+    if ([0, 3, 6, 8, 11, 14].includes(s)) stab(t, ci);
+  }
+}
+function startDemo() {
+  demo.out = ac.createGain(); demo.out.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  demo.out.connect(comp); comp.connect(ac.destination); comp.connect(analyser);
+  demo.comp = comp;
+  demo.step = 0; demo.next = ac.currentTime + 0.1;
+  demo.timer = setInterval(() => {
+    const spb = 60 / demo.bpm / 4;
+    while (demo.next < ac.currentTime + 0.15) { playStep(demo.step, demo.next); demo.next += spb; demo.step++; }
+  }, 25);
+}
+function stopDemo() {
+  if (demo.timer) { clearInterval(demo.timer); demo.timer = null; }
+  if (demo.out) { demo.out.disconnect(); demo.comp.disconnect(); demo.out = null; }
+}
+
+/* ---------- sources ---------- */
+async function startMic() {
+  ensureAC(); stopAll(); resetAnalysis();
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    micNode = ac.createMediaStreamSource(micStream);
+    micNode.connect(analyser);
+    mode = 'mic';
+    toast('Listening… play some EDM nearby, clap, or make noise 🔊');
+  } catch (e) {
+    toast('The microphone is blocked here. Use Demo beat or Upload track — or open this page directly in a browser to use the mic.', 7000);
+  }
+  updateButtons();
+}
+function playTrack() {
+  ensureAC(); stopAll(); resetAnalysis();
+  trackEl.play().then(() => { mode = 'track'; updateButtons(); })
+    .catch(() => toast('Tap “Track” again to start playback.'));
+}
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  ensureAC();
+  if (!trackEl) {
+    trackEl = new Audio(); trackEl.loop = true;
+    trackNode = ac.createMediaElementSource(trackEl);
+    trackNode.connect(analyser); trackNode.connect(ac.destination);
+  }
+  if (trackURL) URL.revokeObjectURL(trackURL);
+  trackURL = URL.createObjectURL(f); trackEl.src = trackURL;
+  trackName = f.name.replace(/\.[^.]+$/, '');
+  e.target.value = '';
+  playTrack();
+  toast('Now dancing to: ' + trackName);
+});
+$('bDemo').onclick = () => {
+  if (mode === 'demo') return stopAll();
+  ensureAC(); stopAll(); resetAnalysis(); startDemo(); mode = 'demo'; updateButtons();
+};
+$('bTrack').onclick = () => {
+  if (!trackEl || !trackEl.src) return $('file').click();
+  if (mode === 'track') return stopAll();
+  playTrack();
+};
+$('bChange').onclick = () => $('file').click();
+$('bMic').onclick = () => mode === 'mic' ? stopAll() : startMic();
+
+function updateButtons() {
+  $('bDemo').classList.toggle('on', mode === 'demo');
+  $('bDemo').textContent = mode === 'demo' ? '■ Stop demo' : '▶ Demo beat';
+  $('bMic').classList.toggle('on', mode === 'mic');
+  $('bMic').textContent = mode === 'mic' ? '■ Stop mic' : '🎤 Mic';
+  const loaded = trackEl && trackEl.src;
+  $('bTrack').classList.toggle('on', mode === 'track');
+  $('bTrack').textContent = !loaded ? '🎵 Upload track' : mode === 'track' ? '⏸ Pause track' : '▶ Track';
+  $('bChange').classList.toggle('hidden', !loaded);
+}
+
+/* ---------- dance state ---------- */
+const st = {
+  ph: 0, bpm: 126, k: 0, E: 0, Es: 0, lastBeatT: -10, ints: [], bh: [], rh: [], prevBass: 0, peak: 0.05,
+  move: 'sway', mir: false, moveB: 0, lastB: 0, hue: 190, t: 0, flash: 0, S: 2, gy: 400, pts: null
+};
+
+const REST = { hx: 0, hy: -78, torso: 0, head: 0, lua: -0.3, lfa: -0.12, rua: 0.3, rfa: 0.12, flx: -18, fly: 0, frx: 18, fry: 0 };
+const KEYS = Object.keys(REST);
+const cur = { ...REST };
+const mirror = p => ({ hx: -p.hx, hy: p.hy, torso: -p.torso, head: -p.head, lua: -p.rua, lfa: -p.rfa, rua: -p.lua, rfa: -p.lfa, flx: -p.frx, fly: p.fry, frx: -p.flx, fry: p.fly });
+const easeSnap = f => f < 0.18 ? 1 - Math.pow(1 - f / 0.18, 3) : 1;
+const frac = x => x - Math.floor(x);
+const dipOf = f => 0.5 + 0.5 * Math.cos(TAU * f);
+
+const RB = [
+  { lua: -PI / 2, lfa: -PI, rua: PI / 2, rfa: 0, head: 0.25 },
+  { lua: -PI / 2, lfa: 0, rua: PI / 2, rfa: PI, head: -0.25 },
+  { lua: -PI / 2, lfa: -PI / 2, rua: PI / 2, rfa: PI / 2, head: 0 },
+  { lua: -0.15, lfa: PI / 2, rua: 0.15, rfa: -PI / 2, head: 0.2 },
+  { lua: -PI / 2, lfa: -PI, rua: PI / 2, rfa: PI, head: -0.15 },
+];
+const rh = b => ((b * 2654435761) >>> 0) % RB.length;
+
+const MOVES = {
+  sway(ph) {
+    const s = Math.sin(PI * ph / 2), dip = dipOf(frac(ph));
+    return { ...REST, hx: 7 * s, hy: -78 + 3 * dip, torso: 0.06 * s, head: 0.08 * s + 0.06 * dip,
+      lua: -0.3 + 0.12 * s, lfa: -0.1 + 0.2 * s, rua: 0.3 + 0.12 * s, rfa: 0.1 + 0.2 * s };
+  },
+  pump(ph) {
+    const dip = dipOf(frac(ph));
+    return { ...REST, hy: -78 + 8 * dip, torso: 0.06, head: 0.2 * dip - 0.05, lua: -0.75, lfa: 0.55,
+      rua: lerp(PI - 1.35, PI - 0.3, dip), rfa: lerp(PI + 0.05, PI - 0.25, dip), flx: -24, frx: 24 };
+  },
+  shuffle(ph) {
+    const b = Math.floor(ph), f = ph - b, side = b & 1, l = Math.sin(PI * f), dip = dipOf(f), sw = side ? -l : l;
+    return { ...REST, hx: 4 * sw, hy: -78 + 6 * dip, torso: 0.07 * sw, head: -0.08 * sw,
+      lua: -0.55 + 0.45 * sw, lfa: -0.55 + 0.45 * sw + 2.1, rua: 0.55 + 0.45 * sw, rfa: 0.55 + 0.45 * sw - 2.1,
+      flx: -16 - (side ? 0 : 5 * l), fly: side ? 0 : -28 * l, frx: 16 + (side ? 5 * l : 0), fry: side ? -28 * l : 0 };
+  },
+  wave(ph) {
+    const s = Math.sin(PI * ph), dip = dipOf(frac(ph));
+    return { ...REST, hx: 10 * s, hy: -78 + 6 * dip, torso: 0.1 * s, head: 0.12 * s,
+      lua: -(PI - 0.5) - 0.35 * s, lfa: -(PI - 0.5) - 0.6 * s, rua: (PI - 0.5) - 0.35 * s, rfa: (PI - 0.5) - 0.6 * s, flx: -22, frx: 22 };
+  },
+  jump(ph) {
+    const f = frac(ph), g = (f - 0.25) / 0.75, J = g > 0 ? 4 * g * (1 - g) : 0,
+      crouch = f < 0.25 ? Math.sin(PI * f / 0.25) : 0, h = 36 * J;
+    return { ...REST, hy: -78 + 12 * crouch - h, head: 0.15 * crouch,
+      flx: -18 - 6 * J, fly: -h * 0.8, frx: 18 + 6 * J, fry: -h * 0.8,
+      lua: lerp(-0.6, -(PI - 0.4), J), lfa: lerp(-0.3, -(PI - 0.25), J), rua: lerp(0.6, PI - 0.4, J), rfa: lerp(0.3, PI - 0.25, J) };
+  },
+  robot(ph) {
+    const b = Math.floor(ph), f = ph - b, e = easeSnap(f), A = RB[rh(b - 1)], B = RB[rh(b)];
+    const o = { ...REST, flx: -22, frx: 22, hy: -78 + 4 * (1 - e) };
+    for (const k in B) o[k] = lerp(A[k], B[k], e);
+    o.hx = lerp(((b - 1) & 1) ? 4 : -4, (b & 1) ? 4 : -4, e);
+    return o;
+  },
+  clap(ph) {
+    const c = Math.pow(dipOf(frac(ph)), 2), s = Math.sin(PI * ph);
+    const lua = -PI + lerp(0.85, 0.28, c), lfa = lerp(-PI + 1.1, -PI - 0.28, c);
+    return { ...REST, hx: 8 * s, hy: -78 + 5 * c, torso: 0.05 * s, head: -0.1 * c,
+      lua, lfa, rua: -lua, rfa: -lfa, flx: -20 + 6 * s, frx: 20 + 6 * s };
+  },
+};
+const NAMES = { sway: 'VIBING', pump: 'FIST PUMP', shuffle: 'SHUFFLE', wave: 'HANDS UP', jump: 'JUMP!', robot: 'ROBOT', clap: 'CLAP STEP' };
+const POOL = ['pump', 'shuffle', 'wave', 'jump', 'robot', 'clap'];
+
+function pickMove(b) {
+  let m;
+  do { m = POOL[Math.floor(Math.random() * POOL.length)]; }
+  while (m === st.move || (m === 'jump' && st.E < 0.5));
+  st.move = m; st.moveB = b; st.mir = Math.random() < 0.5;
+}
+
+/* ---------- analysis ---------- */
+function analyse(dt) {
+  analyser.getByteFrequencyData(freq);
+  analyser.getByteTimeDomainData(td);
+  const sens = +$('sens').value;
+  const binHz = ac.sampleRate / analyser.fftSize;
+  const b0 = Math.max(1, Math.floor(40 / binHz)), b1 = Math.ceil(160 / binHz);
+  let s = 0; for (let i = b0; i <= b1; i++) s += freq[i];
+  const bass = clamp(s / (b1 - b0 + 1) / 255 * (0.6 + 0.4 * sens), 0, 1);
+  let r = 0; for (let i = 0; i < td.length; i++) { const v = (td[i] - 128) / 128; r += v * v; }
+  const x = Math.sqrt(r / td.length) * sens;
+
+  // adaptive loudness → intensity 0..1
+  st.peak = Math.max(x, st.peak * Math.exp(-dt * 0.12), 0.03);
+  const lvl = Math.min(1, x / st.peak * 1.15);
+  st.E += (lvl - st.E) * (1 - Math.exp(-dt * (lvl > st.E ? 8 : 1.8)));
+
+  // onset detection (bass flux, plus loudness spikes for mic/claps)
+  const flux = Math.max(0, bass - st.prevBass); st.prevBass = bass;
+  st.bh.push(flux); if (st.bh.length > 60) st.bh.shift();
+  st.rh.push(x); if (st.rh.length > 45) st.rh.shift();
+  const mf = avg(st.bh), mr = avg(st.rh);
+  let beat = false;
+  if (st.t - st.lastBeatT > 0.28) {
+    const bassHit = flux > Math.max(0.035, 2.2 * mf) && bass > 0.2;
+    const noiseHit = mode === 'mic' && x > mr * 1.7 && x > 0.03;
+    if (bassHit || noiseHit) {
+      beat = true;
+      const iv = st.t - st.lastBeatT;
+      if (iv > 0.3 && iv < 1.05) {
+        st.ints.push(iv); if (st.ints.length > 12) st.ints.shift();
+        let b = 60 / median(st.ints);
+        while (b < 88) b *= 2; while (b > 180) b /= 2;
+        st.bpm += (b - st.bpm) * 0.3;
+      }
+      st.lastBeatT = st.t;
+    }
+  }
+  return beat;
+}
+
+/* ---------- particles ---------- */
+const parts = [];
+function sparks(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = -PI / 2 + (Math.random() - 0.5) * 2.4, v = 120 + Math.random() * 260;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.5 + Math.random() * 0.4, max: 0.9, hue: st.hue + Math.random() * 60, size: 2 + Math.random() * 2, conf: false });
+  }
+}
+function confetti() {
+  for (let i = 0; i < 110; i++) {
+    parts.push({ x: Math.random() * W, y: -20 - Math.random() * 200, vx: (Math.random() - 0.5) * 80, vy: 60 + Math.random() * 120,
+      life: 3 + Math.random() * 1.5, max: 4.5, hue: Math.random() * 360, size: 4 + Math.random() * 4, conf: true, rot: Math.random() * TAU, vr: (Math.random() - 0.5) * 10 });
+  }
+}
+
+/* ---------- figure geometry ---------- */
+function ik(h, f, a, b, outSign) {
+  let dx = f.x - h.x, dy = f.y - h.y, d = Math.hypot(dx, dy);
+  const dd = clamp(d, 1e-3, a + b - 0.01);
+  const base = Math.atan2(dy, dx);
+  const A = Math.acos(clamp((a * a + dd * dd - b * b) / (2 * a * dd), -1, 1));
+  const k1 = { x: h.x + a * Math.cos(base + A), y: h.y + a * Math.sin(base + A) };
+  const k2 = { x: h.x + a * Math.cos(base - A), y: h.y + a * Math.sin(base - A) };
+  const knee = outSign * (k1.x - k2.x) > 0 ? k1 : k2;
+  const foot = d > dd ? { x: h.x + dx / d * dd, y: h.y + dy / d * dd } : f;
+  return [knee, foot];
+}
+function figPoints(p) {
+  const S = st.S, cx = W / 2, gy = st.gy;
+  const hip = { x: cx + p.hx * S, y: gy + p.hy * S };
+  const tv = { x: Math.sin(p.torso), y: -Math.cos(p.torso) };
+  const neck = { x: hip.x + tv.x * 60 * S, y: hip.y + tv.y * 60 * S };
+  const sh = { x: hip.x + tv.x * 52 * S, y: hip.y + tv.y * 52 * S };
+  const ha = p.torso + p.head;
+  const head = { x: neck.x + Math.sin(ha) * 25 * S, y: neck.y - Math.cos(ha) * 25 * S };
+  const arm = (u, f) => {
+    const e = { x: sh.x + Math.sin(u) * 34 * S, y: sh.y + Math.cos(u) * 34 * S };
+    return [e, { x: e.x + Math.sin(f) * 32 * S, y: e.y + Math.cos(f) * 32 * S }];
+  };
+  const [le, lh] = arm(p.lua, p.lfa), [re, rhd] = arm(p.rua, p.rfa);
+  const [lk, lf] = ik(hip, { x: cx + p.flx * S, y: gy + p.fly * S }, 42 * S, 42 * S, -1);
+  const [rk, rf] = ik(hip, { x: cx + p.frx * S, y: gy + p.fry * S }, 42 * S, 42 * S, 1);
+  return { hip, neck, sh, head, ha, le, lh, re, rh: rhd, lk, lf, rk, rf };
+}
+function drawFigure(P, alpha) {
+  const S = st.S;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#f4f2ff';
+  ctx.lineWidth = Math.max(3, 5 * S);
+  ctx.shadowColor = `hsl(${st.hue},100%,60%)`;
+  ctx.shadowBlur = 10 + 26 * st.E * (0.5 + 0.5 * st.k);
+  ctx.beginPath();
+  const seg = (...pts) => { ctx.moveTo(pts[0].x, pts[0].y); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y); };
+  seg(P.hip, P.neck);
+  seg(P.sh, P.le, P.lh); seg(P.sh, P.re, P.rh);
+  seg(P.hip, P.lk, P.lf); seg(P.hip, P.rk, P.rf);
+  ctx.stroke();
+  // head
+  ctx.beginPath(); ctx.arc(P.head.x, P.head.y, 15 * S, 0, TAU);
+  ctx.fillStyle = '#0b0a14'; ctx.fill(); ctx.stroke();
+  // rave shades
+  ctx.translate(P.head.x, P.head.y); ctx.rotate(P.ha);
+  ctx.shadowBlur = 14;
+  ctx.strokeStyle = `hsl(${st.hue + 160},100%,65%)`;
+  ctx.lineWidth = 4.5 * S;
+  ctx.beginPath(); ctx.moveTo(-10 * S, -2 * S); ctx.lineTo(10 * S, -2 * S); ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- scene ---------- */
+function drawScene() {
+  const gy = st.gy, hue = st.hue;
+  ctx.fillStyle = '#07060d'; ctx.fillRect(0, 0, W, H);
+
+  // stage glow behind dancer
+  const g = ctx.createRadialGradient(W / 2, gy - 100 * st.S, 10, W / 2, gy - 100 * st.S, Math.max(W, H) * 0.6);
+  g.addColorStop(0, `hsla(${hue},90%,50%,${0.1 + 0.3 * st.E * (0.4 + 0.6 * st.k)})`);
+  g.addColorStop(1, 'hsla(0,0%,0%,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  // lasers
+  if (st.E > 0.15) {
+    const a = Math.min(1, (st.E - 0.15) * 1.6) * (0.3 + 0.5 * st.k);
+    const L = Math.hypot(W, H) * 1.2;
+    for (const side of [-1, 1]) {
+      const ox = side < 0 ? 0 : W;
+      for (let i = 0; i < 4; i++) {
+        const base = 0.45 + 0.35 * Math.sin(st.t * (0.7 + 0.15 * i) + i * 0.9 + (side > 0 ? 1.7 : 0)) + i * 0.1;
+        const ang = side < 0 ? base : PI - base;
+        const x2 = ox + Math.cos(ang) * L, y2 = Math.sin(ang) * L;
+        const col = `hsla(${hue + 180 + i * 18},100%,62%,`;
+        ctx.strokeStyle = col + a * 0.22 + ')'; ctx.lineWidth = 7;
+        ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(x2, y2); ctx.stroke();
+        ctx.strokeStyle = col + a + ')'; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+    }
+  }
+  // spectrum bars on the back wall
+  if (mode && freq) {
+    const n = 36, bw = W / (n * 2), maxH = gy * 0.42;
+    for (let i = 0; i < n; i++) {
+      const bi = Math.floor(2 * Math.pow(400, i / n));
+      const v = (freq[Math.min(bi, freq.length - 1)] / 255) * (0.6 + 0.4 * st.E);
+      const h = v * v * maxH;
+      ctx.fillStyle = `hsla(${hue + i * 4},90%,55%,0.16)`;
+      ctx.fillRect(W / 2 + i * bw + 1, gy - h, bw - 2, h);
+      ctx.fillRect(W / 2 - (i + 1) * bw + 1, gy - h, bw - 2, h);
+    }
+  }
+  ctx.restore();
+
+  // perspective floor grid
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, gy, W, H - gy); ctx.clip();
+  const ga = 0.1 + 0.25 * st.k * st.E;
+  ctx.strokeStyle = `hsla(${hue + 40},100%,60%,${ga})`; ctx.lineWidth = 1;
+  const fr = frac(st.ph);
+  for (let i = 0; i < 12; i++) {
+    const d = (i + fr) / 12, y = gy + d * d * (H - gy) * 1.2;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  for (let j = -12; j <= 12; j++) {
+    ctx.beginPath(); ctx.moveTo(W / 2 + j * 14, gy); ctx.lineTo(W / 2 + j * 120, H + 40); ctx.stroke();
+  }
+  ctx.restore();
+
+  // floor line
+  const fl = ctx.createLinearGradient(0, 0, W, 0);
+  fl.addColorStop(0, 'hsla(0,0%,100%,0)'); fl.addColorStop(0.5, `hsla(${hue},100%,75%,0.8)`); fl.addColorStop(1, 'hsla(0,0%,100%,0)');
+  ctx.fillStyle = fl; ctx.fillRect(0, gy - 1, W, 2);
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+let hudT = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; st.t += dt;
+
+  const bar = $('bar').offsetHeight;
+  const avail = H - bar;
+  st.gy = avail * 0.8 + 6;
+  st.S = Math.max(0.6, Math.min((st.gy - 84) / 214, W / 190));
+
+  let beat = false;
+  if (mode && analyser) beat = analyse(dt);
+  else { st.E += (0 - st.E) * (1 - Math.exp(-dt * 2)); }
+  st.Es += (st.E - st.Es) * (1 - Math.exp(-dt * 0.6));
+
+  // beat clock
+  const active = st.E > 0.06;
+  st.ph += dt * st.bpm / 60 * (active ? 1 : 0.35);
+  if (beat) {
+    st.k = 1; st.hue += 22;
+    const n = Math.round(st.ph), d = n - st.ph;
+    st.ph += d * (Math.abs(d) < 0.35 ? 0.55 : 0.15);
+  }
+  st.k *= Math.exp(-dt * 7);
+  st.hue += dt * 10;
+  st.flash *= Math.exp(-dt * 4);
+
+  // choreography
+  const b = Math.floor(st.ph);
+  const quiet = !mode || st.t - st.lastBeatT > 1.6 || st.E < 0.12;
+  if (st.move === 'sway' && beat && !quiet && st.E > 0.4) {
+    // music kicks back in → the drop
+    st.move = 'jump'; st.moveB = b; st.mir = false; st.flash = 1; confetti();
+  }
+  if (b > st.lastB) {
+    st.lastB = b;
+    if (quiet) { if (st.move !== 'sway') { st.move = 'sway'; st.moveB = b; } }
+    else if (st.move === 'sway' || b - st.moveB >= 8) pickMove(b);
+  }
+
+  // target pose = sway blended toward move by intensity
+  let tgt = MOVES[st.move](st.ph);
+  if (st.move !== 'sway') {
+    const amp = clamp((st.E - 0.08) * 1.9, 0.25, 1), base = MOVES.sway(st.ph);
+    for (const k of KEYS) tgt[k] = lerp(base[k], tgt[k], amp);
+    if (st.mir) tgt = mirror(tgt);
+  }
+  const rate = 1 - Math.exp(-dt * (st.move === 'robot' ? 30 : 18));
+  for (const k of KEYS) cur[k] = lerp(cur[k], tgt[k], rate);
+
+  // draw
+  drawScene();
+  const P = figPoints(cur);
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath(); ctx.ellipse(W / 2 + cur.hx * st.S, st.gy + 2, 34 * st.S * (1 - Math.min(0.5, (-cur.fly - cur.fry) / 120)), 5 * st.S, 0, 0, TAU); ctx.fill();
+  // reflection
+  ctx.save(); ctx.translate(0, 2 * st.gy); ctx.scale(1, -1); drawFigure(P, 0.12); ctx.restore();
+  drawFigure(P, 1);
+
+  if (beat && st.E > 0.4) {
+    const n = Math.round(3 + 8 * st.E);
+    sparks(P.lf.x, P.lf.y, n >> 1); sparks(P.rf.x, P.rf.y, n >> 1);
+  }
+
+  // particles
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt; if (p.life <= 0 || p.y > H + 20) { parts.splice(i, 1); continue; }
+    p.vy += (p.conf ? 40 : 520) * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    const a = Math.min(1, p.life / 0.4);
+    ctx.fillStyle = `hsla(${p.hue},100%,65%,${a})`;
+    if (p.conf) {
+      p.rot += p.vr * dt; p.vx += Math.sin(st.t * 3 + i) * 20 * dt;
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2); ctx.restore();
+    } else { ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill(); }
+  }
+  ctx.restore();
+
+  if (st.flash > 0.01) { ctx.fillStyle = `hsla(${st.hue},100%,80%,${0.35 * st.flash})`; ctx.fillRect(0, 0, W, H); }
+
+  // HUD
+  hudT -= dt;
+  if (hudT <= 0) {
+    hudT = 0.1;
+    $('mv').textContent = mode ? NAMES[st.move] : 'IDLE';
+    $('bpm').textContent = mode && st.ints.length > 2 ? Math.round(st.bpm) : '—';
+  }
+  $('lv').style.width = (st.E * 100).toFixed(0) + '%';
+
+  requestAnimationFrame(frame);
+}
+updateButtons();
+toast('Tap “Demo beat” to start the party — or upload a track or use the mic.', 5000);
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
